@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  reddit-scraper:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    volumes:
+      # Optional: Mount logs directory
+      - ./logs:/app/logs
+    networks:
+      - reddit-scraper-network
+
+  # Optional: Add nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - reddit-scraper
+    restart: unless-stopped
+    networks:
+      - reddit-scraper-network
+    profiles:
+      - with-nginx
+
+networks:
+  reddit-scraper-network:
+    driver: bridge
+
+volumes:
+  logs:
+
