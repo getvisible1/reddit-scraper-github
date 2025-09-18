@@ -1,114 +1,70 @@
-name: CI/CD Pipeline
+name: Deploy to Ubuntu (Nginx + Gunicorn)
 
 on:
   push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  APP_DIR: ${{ secrets.APP_DIR }}
+  PYTHON_VERSION: ${{ secrets.PYTHON_VERSION || '3.12' }}
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: [3.8, 3.9, '3.10', 3.11]
-
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-    
-    - name: Cache pip dependencies
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest pytest-cov flake8
-    
-    - name: Lint with flake8
-      run: |
-        # Stop the build if there are Python syntax errors or undefined names
-        flake8 src --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Exit-zero treats all errors as warnings
-        flake8 src --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    
-    - name: Test application startup
-      run: |
-        # Test if the application can start without errors
-        timeout 10s python src/main.py || code=$?; if [[ $code -ne 124 && $code -ne 0 ]]; then exit $code; fi
-    
-    - name: Security scan with bandit
-      run: |
-        pip install bandit
-        bandit -r src/ -f json -o bandit-report.json || true
-    
-    - name: Upload security scan results
-      uses: actions/upload-artifact@v3
-      if: always()
-      with:
-        name: security-scan-results
-        path: bandit-report.json
-
-  docker:
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-      if: github.event_name != 'pull_request'
-    
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: your-dockerhub-username/reddit-scraper-pro
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=sha,prefix={{branch}}-
-          type=raw,value=latest,enable={{is_default_branch}}
-    
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        platforms: linux/amd64,linux/arm64
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
   deploy:
     runs-on: ubuntu-latest
-    needs: [test, docker]
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    
-    steps:
-    - name: Deploy to production
-      run: |
-        echo "Add your deployment steps here"
-        echo "For example: SSH to server and pull latest Docker image"
-        # ssh user@server "docker pull your-dockerhub-username/reddit-scraper-pro:latest && docker-compose up -d"
 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Warm server known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Create app dir & python venv (first run safe)
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p $APP_DIR && python3 -m venv $APP_DIR/.venv || true"
+
+      - name: Rsync source to server
+        run: |
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".github" \
+            --exclude "__pycache__" \
+            --exclude "venv" \
+            --exclude ".venv" \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$APP_DIR/
+
+      - name: Install dependencies on server
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "$APP_DIR/.venv/bin/pip install --upgrade pip && \
+             $APP_DIR/.venv/bin/pip install -r $APP_DIR/requirements.txt"
+
+      # Optional: run DB migrations, build assets, etc.
+      # - name: Run Flask DB migrations
+      #   run: |
+      #     ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+      #       "cd $APP_DIR && ./.venv/bin/flask db upgrade"
+
+      - name: Fix permissions (socket & app)
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo chown -R deploy:www-data /var/www/todaysforecast && sudo chmod -R g+rwX /var/www/todaysforecast"
+
+      - name: Restart Gunicorn
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo systemctl restart todaysforecast.service && sudo systemctl status todaysforecast.service --no-pager -l || true"
+
+      - name: Health check (HTTP 200 expected)
+        run: |
+          # Adjust domain/path as needed
+          curl -I --max-time 15 https://todaysforecast.co || curl -I --max-time 15 http://todaysforecast.co
